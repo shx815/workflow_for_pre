@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+vendor/douyin-favorites-to-knowledge/.venv/
+.pytest_cache/
+vendor/node-runtime/
+vendor/rednote-runtime/node_modules/
+vendor/playwright-browsers/
+state/rednote-private/
+
+# Local account state, extraction ledgers and original third-party media.
+/state/
+/interview-kb/raw/
+/interview-kb/_fav2kb/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+cookies.json
+storage-state.json
+
+# Reinstall dependencies rather than committing runtimes or nested repositories.
+/vendor/*
+!/vendor/rednote-runtime/
+/vendor/rednote-runtime/*
+!/vendor/rednote-runtime/package.json
+!/vendor/rednote-runtime/package-lock.json

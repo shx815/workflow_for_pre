@@ -1,0 +1,525 @@
+--- a/dist/server.js
++++ b/dist/server.js
+@@ -66,6 +66,8 @@
+     textContent += `**正文**:\n${note.content}\n`;
+     if (note.images && note.images.length > 0) {
+         textContent += `\n**图片数量**: ${note.images.length} 张\n`;
++        textContent += `**图片范围**: ${note.imageScope || 'unverified'}\n`;
++        textContent += `**预期图片数**: ${note.expectedImageCount ?? 'unknown'}\n`;
+         // 添加压缩统计信息
+         const compressedImages = note.images.filter(img => img.compressionRatio !== undefined);
+         if (compressedImages.length > 0) {
+@@ -156,7 +158,7 @@
+         return page;
+     }
+     console.error('🚀 初始化浏览器...');
+-    browser = await playwright_1.chromium.launch({ headless: false }); // 使用有头模式以便调试
++    browser = await playwright_1.chromium.launch({ headless: false, channel: 'chrome' }); // 使用本机稳定版 Chrome
+     context = await browser.newContext();
+     // 加载 cookies
+     const cookies = await loadCookies();
+@@ -173,15 +175,15 @@
+  */
+ async function closeBrowser() {
+     if (page) {
+-        await page.close();
++        await page.close().catch(() => {});
+         page = null;
+     }
+     if (context) {
+-        await context.close();
++        await context.close().catch(() => {});
+         context = null;
+     }
+     if (browser) {
+-        await browser.close();
++        await browser.close().catch(() => {});
+         browser = null;
+     }
+ }
+@@ -215,7 +217,7 @@
+                     description: '等待用户完成登录的超时时间（毫秒），默认60秒',
+                     default: 60000,
+                     minimum: 30000,
+-                    maximum: 120000
++                    maximum: 600000
+                 }
+             }
+         }
+@@ -391,7 +393,7 @@
+             }
+             case 'login': {
+                 const schema = zod_1.z.object({
+-                    timeout: zod_1.z.number().min(30000).max(120000).default(60000)
++                    timeout: zod_1.z.number().min(30000).max(600000).default(600000)
+                 });
+                 const { timeout } = schema.parse(args);
+                 const currentPage = await initBrowser();
+@@ -599,4 +601,4 @@
+     console.error('启动失败:', error);
+     process.exit(1);
+ });
+-//# sourceMappingURL=server.js.map
+\ No newline at end of file
++//# sourceMappingURL=server.js.map
+--- a/dist/cli.js
++++ b/dist/cli.js
+@@ -40,7 +40,7 @@
+     let page = null;
+     try {
+         console.log('🌐 正在启动浏览器...\n');
+-        browser = await playwright_1.chromium.launch({ headless: false });
++        browser = await playwright_1.chromium.launch({ headless: false, channel: 'chrome' });
+         context = await browser.newContext();
+         page = await context.newPage();
+         console.log('🔐 开始登录流程...');
+@@ -98,4 +98,4 @@
+     console.error('\n❌ 初始化失败：', error.message);
+     process.exit(1);
+ });
+-//# sourceMappingURL=cli.js.map
+\ No newline at end of file
++//# sourceMappingURL=cli.js.map
+--- a/dist/tools/auth.js
++++ b/dist/tools/auth.js
+@@ -37,13 +37,14 @@
+         });
+         await page.waitForTimeout(constants_1.TIMING.INITIAL_PAGE_WAIT_MS);
+         // 检查登录状态指标
+-        const loginStatus = await page.evaluate(() => {
++        const hasSession = (await page.context().cookies('https://www.xiaohongshu.com')).some(cookie => cookie.name === 'web_session' && Boolean(cookie.value));
++        const loginStatus = await page.evaluate((hasSession) => {
+             const indicators = {
+-                hasCookies: document.cookie.includes('web_session') ||
+-                    document.cookie.includes('xsecappid') ||
+-                    document.cookie.includes('a1=') ||
+-                    document.cookie.includes('webId='),
+-                hasUserAvatar: document.querySelectorAll('[class*="avatar"]').length > 0,
++                // `a1`, `webId` and `xsecappid` are also issued to anonymous
++                // visitors. Treating them as authentication makes first-run
++                // initialization report a false success without saving cookies.
++                hasCookies: hasSession,
++                hasUserAvatar: false,
+                 hasLoginButton: (() => {
+                     const buttons = Array.from(document.querySelectorAll('button, a'));
+                     return buttons.some(btn => {
+@@ -52,12 +53,12 @@
+                     });
+                 })()
+             };
+-            const isLoggedIn = (indicators.hasCookies || indicators.hasUserAvatar) && !indicators.hasLoginButton;
++            const isLoggedIn = indicators.hasCookies && !indicators.hasLoginButton;
+             return {
+                 isLoggedIn,
+                 indicators
+             };
+-        });
++        }, hasSession);
+         if (loginStatus.isLoggedIn) {
+             logger_1.logger.debug('✅ 已登录');
+             return {
+@@ -134,16 +135,27 @@
+         while (Date.now() - startTime < timeout) {
+             await page.waitForTimeout(checkInterval);
+             // 检查是否已登录
+-            const currentStatus = await page.evaluate(() => {
+-                const hasCookies = document.cookie.includes('web_session') ||
+-                    document.cookie.includes('a1=');
+-                const hasAvatar = document.querySelectorAll('[class*="avatar"]').length > 0;
+-                const hasLoginButton = Array.from(document.querySelectorAll('button, a')).some(btn => {
+-                    const text = btn.textContent?.trim().toLowerCase() || '';
+-                    return text.includes('登录') || text.includes('login');
+-                });
+-                return (hasCookies || hasAvatar) && !hasLoginButton;
+-            });
++            let currentStatus = false;
++            try {
++                const hasSession = (await page.context().cookies('https://www.xiaohongshu.com')).some(cookie => cookie.name === 'web_session' && Boolean(cookie.value));
++                currentStatus = await page.evaluate((hasSession) => {
++                    const hasLoginButton = Array.from(document.querySelectorAll('button, a')).some(btn => {
++                        const text = btn.textContent?.trim().toLowerCase() || '';
++                        return text.includes('登录') || text.includes('login');
++                    });
++                    return hasSession && !hasLoginButton;
++                }, hasSession);
++            }
++            catch (error) {
++                // QR login navigates the page and can destroy the old execution
++                // context between waitForTimeout and evaluate. Retry on the next
++                // polling interval instead of treating successful navigation as
++                // a fatal login error.
++                if (!String(error?.message || error).includes('Execution context was destroyed')) {
++                    throw error;
++                }
++                continue;
++            }
+             if (currentStatus) {
+                 logger_1.logger.debug('✅ 检测到登录成功！');
+                 const context = page.context();
+@@ -360,4 +372,4 @@
+     const userId = loadUserId();
+     return userId || 'me';
+ }
+-//# sourceMappingURL=auth.js.map
+\ No newline at end of file
++//# sourceMappingURL=auth.js.map
+--- a/dist/tools/favoritesList.js
++++ b/dist/tools/favoritesList.js
+@@ -22,9 +22,9 @@
+  * logger.debug(`获取到 ${favorites.length} 条收藏`);
+  * ```
+  */
+-async function getFavoritesList(page, userId, limit = 20) {
++async function getFavoritesList(page, userId, limit = 20, folderName = process.env.REDNOTE_FAVORITE_FOLDER || 'knowledge') {
+     // 如果未提供 userId，从配置文件读取
+-    const actualUserId = userId || (0, auth_1.getUserId)();
++    const actualUserId = !userId || userId === 'me' ? (0, auth_1.getUserId)() : userId;
+     logger_1.logger.debug(`  👤 使用用户 ID: ${actualUserId}`);
+     // 1. 访问首页并检查登录状态
+     logger_1.logger.debug('  🔐 步骤 1: 访问首页并检查登录状态...');
+@@ -113,11 +113,53 @@
+     }
+     // 2. 导航到收藏夹页面
+     logger_1.logger.debug('  📂 访问收藏夹页面...');
+-    const url = `https://www.xiaohongshu.com/user/profile/${actualUserId}?tab=fav&subTab=note`;
++    const directFolderUrl = process.env.REDNOTE_FAVORITE_FOLDER_URL;
++    if (directFolderUrl) {
++        const scopedUrl = new URL(directFolderUrl);
++        if (scopedUrl.origin !== 'https://www.xiaohongshu.com' || !/^\/board\/[a-zA-Z0-9]+\/?$/.test(scopedUrl.pathname)) {
++            throw new Error('专辑 URL 必须是小红书站内的单个 board 页面');
++        }
++    }
++    const url = directFolderUrl || `https://www.xiaohongshu.com/user/profile/${actualUserId}?tab=fav&subTab=${folderName ? 'board' : 'note'}`;
+     await page.goto(url, {
+         waitUntil: 'domcontentloaded',
+         timeout: 30000
+     });
++    if (folderName && !directFolderUrl) {
++        // Activate the actual tabs after hydration; the site sometimes ignores
++        // initial query parameters and leaves the panels uninitialized.
++        const savedTab = page.getByText('收藏', { exact: true }).filter({ visible: true });
++        if (await savedTab.count()) {
++            await savedTab.first().dispatchEvent('click');
++            await page.waitForTimeout(1000);
++        }
++        const boardTab = page.getByText(/^专辑\s*[·・]/).filter({ visible: true });
++        if (await boardTab.count()) {
++            await boardTab.first().dispatchEvent('click');
++            await page.waitForTimeout(1000);
++        }
++        const folder = page.getByText(folderName, { exact: true }).filter({ visible: true });
++        try {
++            await folder.first().waitFor({ state: 'visible', timeout: 30000 });
++        } catch (error) {
++            const diagnostic = await page.evaluate(() => ({
++                path: location.pathname,
++                text: document.body.innerText.slice(0, 2500),
++                links: Array.from(document.querySelectorAll('a')).filter(a => /knowledge|专辑|收藏/i.test(a.textContent || '')).map(a => ({ text: a.textContent?.slice(0, 100), path: new URL(a.href, location.href).pathname }))
++            }));
++            throw new Error(`指定专辑未显示：${JSON.stringify(diagnostic)}`);
++        }
++        const links = await folder.evaluateAll(elements => elements.map(element => element.closest('a')?.href || ''));
++        if (links.length > 1 && (links.some(link => !link) || new Set(links).size !== 1)) {
++            throw new Error(`目标专辑不唯一：${folderName}；候选路径：${JSON.stringify(links.map(link => { try { return new URL(link).pathname; } catch { return ''; } }))}；已停止。`);
++        }
++        if (!links[0] || new URL(links[0]).origin !== 'https://www.xiaohongshu.com') {
++            throw new Error('指定专辑没有有效的站内链接，已停止。');
++        }
++        await page.goto(links[0], { waitUntil: 'domcontentloaded', timeout: 30000 });
++        await page.waitForTimeout(3000);
++        console.error(`已打开指定专辑：${folderName}`);
++    }
+     // 2. 等待笔记列表渲染完成
+     // 根据调研结果，笔记容器是 section.note-item
+     logger_1.logger.debug('  🔍 查找收藏笔记...');
+@@ -172,8 +214,20 @@
+             let noteUrl = '';
+             let noteId = '';
+             let xsecToken = '';
++            let xsecSource = '';
+             for (const link of allLinks) {
+                 const href = link.href || link.getAttribute('href') || '';
++                // Board note links carry the access parameters too; the upstream
++                // extractor only recognized profile note links and lost these.
++                if (href.includes('/board/') && href.includes('xsec_token=')) {
++                    const boardUrl = new URL(href, location.href);
++                    const boardMatch = boardUrl.pathname.match(/^\/board\/[^/]+\/([a-zA-Z0-9]{20,40})\/?$/);
++                    if (boardMatch) {
++                        noteId = boardMatch[1];
++                        xsecToken = boardUrl.searchParams.get('xsec_token') || '';
++                        xsecSource = boardUrl.searchParams.get('xsec_source') || '';
++                    }
++                }
+                 // 从 profile 链接中提取 token 和 noteId
+                 if (href.includes('xsec_token=') && href.includes('/profile/')) {
+                     const noteIdMatch = href.match(/\/profile\/[^/]+\/([a-zA-Z0-9]+)/);
+@@ -187,6 +241,10 @@
+                 }
+                 // 备用：获取 explore 链接
+                 if (href.includes('/explore/')) {
++                    const tokenMatch = href.match(/xsec_token=([^&]+)/);
++                    if (tokenMatch && tokenMatch[1]) {
++                        xsecToken = decodeURIComponent(tokenMatch[1]);
++                    }
+                     const noteIdMatch = href.match(/\/explore\/([a-zA-Z0-9]+)/);
+                     if (noteIdMatch && noteIdMatch[1] && noteIdMatch[1].length >= 20 && !noteId) {
+                         noteId = noteIdMatch[1];
+@@ -197,7 +255,7 @@
+             if (noteId) {
+                 if (xsecToken) {
+                     // 构造带 token 的 explore URL
+-                    noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${encodeURIComponent(xsecToken)}`;
++                    noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${encodeURIComponent(xsecToken)}${xsecSource ? '&xsec_source=' + encodeURIComponent(xsecSource) : ''}`;
+                 }
+                 else {
+                     // 没有token就用基本的 explore URL
+@@ -220,7 +278,7 @@
+     }, limit);
+     logger_1.logger.debug(`\n  📊 提取结果: 共 ${rawData.length} 条`);
+     // 过滤掉没有 URL 的条目
+-    const extractedNotes = rawData.filter(note => note.url && note.noteId);
++    const extractedNotes = rawData.filter(note => note.url && note.noteId).map(note => ({ ...note, source_folder: folderName || null }));
+     logger_1.logger.debug(`  ✅ 有效笔记: ${extractedNotes.length} 条\n`);
+     // 调试输出
+     if (extractedNotes.length > 0) {
+@@ -245,4 +303,4 @@
+ async function getMyFavorites(page, limit = 20) {
+     return getFavoritesList(page, 'me', limit);
+ }
+-//# sourceMappingURL=favoritesList.js.map
+\ No newline at end of file
++//# sourceMappingURL=favoritesList.js.map
+--- a/dist/tools/batchNotes.js
++++ b/dist/tools/batchNotes.js
+@@ -9,6 +9,17 @@
+ const logger_1 = require("./logger");
+ const favoritesList_1 = require("./favoritesList");
+ const noteContent_1 = require("./noteContent");
++const fs = require('fs');
++const path = require('path');
++function saveCheckpoint(result) {
++    const target = process.env.REDNOTE_BATCH_CHECKPOINT_PATH;
++    if (!target) return;
++    fs.mkdirSync(path.dirname(target), { recursive: true });
++    const temporary = target + '.tmp';
++    const envelope = { content: [{ type: 'text', text: JSON.stringify(result) }], checkpoint: true };
++    fs.writeFileSync(temporary, JSON.stringify(envelope), { mode: 0o600 });
++    fs.renameSync(temporary, target);
++}
+ /**
+  * 从收藏夹批量获取笔记内容
+  *
+@@ -51,7 +62,18 @@
+         // 2. 逐个获取笔记内容
+         logger_1.logger.debug(`📖 步骤 2: 获取笔记内容 (共 ${favorites.length} 条)...\n`);
+         for (let i = 0; i < favorites.length; i++) {
++            if (i > 0) {
++                await page.waitForTimeout(3000 + Math.random() * 3000);
++            }
+             const favorite = favorites[i];
++            if (!new URL(favorite.url).searchParams.has('xsec_token')) {
++                result.failedCount++;
++                result.errors.push({ url: favorite.url, error: '缺少页面提供的 xsec_token，停止批处理以避免无效请求' });
++                result.stoppedEarly = true;
++                saveCheckpoint(result);
++                break;
++            }
++            console.error(`正在提取笔记 ${i + 1}/${favorites.length}: ${favorite.title}`);
+             logger_1.logger.debug(`[${i + 1}/${favorites.length}] ${favorite.title}`);
+             logger_1.logger.debug(`   URL: ${favorite.url.substring(0, 60)}...`);
+             try {
+@@ -65,13 +87,8 @@
+                 });
+                 result.notes.push(noteContent);
+                 result.successCount++;
++                console.error(`提取完成 ${i + 1}/${favorites.length}: 正文 ${noteContent.content.length} 字，图片 ${noteContent.images.length} 张`);
+                 logger_1.logger.debug(`   ✅ 成功！ 正文: ${noteContent.content.length} 字, 图片: ${noteContent.images.length} 张\n`);
+-                // 添加随机延迟，避免触发反爬虫
+-                if (i < favorites.length - 1) {
+-                    const delay = 1000 + Math.random() * 2000; // 1-3 秒随机延迟
+-                    logger_1.logger.debug(`   ⏳ 等待 ${(delay / 1000).toFixed(1)} 秒...\n`);
+-                    await page.waitForTimeout(delay);
+-                }
+             }
+             catch (error) {
+                 result.failedCount++;
+@@ -80,7 +97,15 @@
+                     error: error.message
+                 });
+                 logger_1.logger.debug(`   ❌ 失败: ${error.message}\n`);
++                if (/error_code=300031|登录状态异常|需要重新登录|验证码|captcha|verification/i.test(error.message)) {
++                    result.stoppedEarly = true;
++                    console.error('检测到登录异常或验证要求，停止剩余请求，请检查平台提示。');
++                    break;
++                }
+             }
++            finally {
++                saveCheckpoint(result);
++            }
+         }
+         // 3. 汇总统计
+         logger_1.logger.debug('='.repeat(80));
+@@ -155,4 +180,4 @@
+     logger_1.logger.debug(`📊 完成！ 成功: ${result.successCount}, 失败: ${result.failedCount}\n`);
+     return result;
+ }
+-//# sourceMappingURL=batchNotes.js.map
+\ No newline at end of file
++//# sourceMappingURL=batchNotes.js.map
+--- a/dist/tools/imageDownloader.js
++++ b/dist/tools/imageDownloader.js
+@@ -16,6 +16,7 @@
+ const fs_1 = __importDefault(require("fs"));
+ const path_1 = __importDefault(require("path"));
+ const os_1 = __importDefault(require("os"));
++const crypto = require('crypto');
+ /**
+  * 从笔记页面下载所有图片
+  *
+@@ -54,10 +55,9 @@
+     // 2. 导航到笔记详情页（非常重要！）
+     logger_1.logger.debug(`  📄 从收藏夹 → 笔记详情页...`);
+     logger_1.logger.debug(`  🔗 目标 URL: ${noteUrl.substring(0, 80)}...`);
+-    await page.goto(noteUrl, {
+-        waitUntil: 'domcontentloaded',
+-        timeout: 30000
+-    });
++    if (page.url().split('?')[0] !== noteUrl.split('?')[0]) {
++        await page.goto(noteUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
++    }
+     // 验证是否成功进入笔记详情页
+     const currentUrl = page.url();
+     logger_1.logger.debug(`  ✅ 当前页面: ${currentUrl.substring(0, 80)}...`);
+@@ -202,6 +202,18 @@
+         logger_1.logger.debug('');
+     }
+     const imageUrls = await page.evaluate(() => {
++        const currentId = location.pathname.match(/\/explore\/([a-zA-Z0-9]+)/)?.[1];
++        const note = window.__INITIAL_STATE__?.note?.noteDetailMap?.[currentId]?.note;
++        if (note?.noteId === currentId && Array.isArray(note.imageList)) {
++            const urls = note.imageList.map(image => image.urlDefault || image.url ||
++                image.infoList?.find(info => info.imageScene === 'WB_DFT')?.url || image.infoList?.[0]?.url)
++                .filter(url => typeof url === 'string' && /^https?:\/\//.test(url));
++            return Array.from(new Set(urls));
++        }
++        // Never fall back to the whole document: it contains recommendation
++        // cards whose images do not belong to the current note.
++        const scope = document.querySelector('#noteContainer');
++        if (!scope) return [];
+         const selectors = [
+             'img.note-slider-img', // 笔记轮播图片（最精确）
+             'img[src*="sns-webpic"]', // 主要 CDN（调研确认）
+@@ -237,7 +249,7 @@
+             return true;
+         };
+         for (const selector of selectors) {
+-            const imgs = Array.from(document.querySelectorAll(selector));
++            const imgs = Array.from(scope.querySelectorAll(selector));
+             imgs.forEach(img => {
+                 if (isXiaohongshuImage(img.src) && isValidNoteImage(img)) {
+                     foundImages.add(img.src);
+@@ -250,7 +262,7 @@
+         }
+         // 如果上面的选择器都没找到，尝试获取所有小红书 CDN 的图片（但仍然过滤小图片）
+         if (foundImages.size === 0) {
+-            const allImgs = Array.from(document.querySelectorAll('img'));
++            const allImgs = Array.from(scope.querySelectorAll('img'));
+             allImgs.forEach(img => {
+                 if (isXiaohongshuImage(img.src) && isValidNoteImage(img)) {
+                     foundImages.add(img.src);
+@@ -260,6 +272,15 @@
+         return Array.from(foundImages);
+     });
+     if (imageUrls.length === 0) {
++        const diagnostic = await page.evaluate(() => ({
++            path: location.pathname,
++            videos: document.querySelectorAll('video').length,
++            images: Array.from(document.querySelectorAll('img')).map(img => ({
++                className: img.className, width: img.naturalWidth, height: img.naturalHeight,
++                loaded: Boolean(img.src), host: (() => { try { return new URL(img.src).hostname; } catch { return ''; } })()
++            })).slice(0, 20)
++        }));
++        console.error(`未提取到笔记图片，页面诊断：${JSON.stringify(diagnostic)}`);
+         logger_1.logger.debug('\n  ⚠️ 未找到任何图片！');
+         logger_1.logger.debug('  💡 可能的原因：');
+         logger_1.logger.debug('     1. 页面需要更长的加载时间');
+@@ -337,18 +358,19 @@
+             logger_1.logger.debug(`  ✅ 成功！最终大小: ${(finalBuffer.length / 1024).toFixed(2)} KB`);
+         }
+         catch (error) {
+-            logger_1.logger.warn(`  ❌ 下载图片失败 ${imageUrl.substring(0, 60)}...: ${error.message}`);
++            console.error(`笔记图片 ${i + 1}/${imageUrls.length} 下载失败：${String(error.message).replace(/https?:\/\/[^\s]+/g, '[image URL]')}`);
+             continue;
+         }
+     }
+     logger_1.logger.debug(`\n  📊 下载完成: 成功 ${images.length}/${imageUrls.length} 张\n`);
+     // 5. 按文件大小去重（避免重复下载相同图片的不同URL）
+     const uniqueImages = [];
+-    const seenSizes = new Set();
++    const seenHashes = new Set();
+     for (const img of images) {
+-        if (!seenSizes.has(img.size)) {
++        const digest = crypto.createHash('sha256').update(Buffer.from(img.base64, 'base64')).digest('hex');
++        if (!seenHashes.has(digest)) {
+             uniqueImages.push(img);
+-            seenSizes.add(img.size);
++            seenHashes.add(digest);
+         }
+         else {
+             logger_1.logger.debug(`  🔄 跳过重复图片 (${(img.size / 1024).toFixed(2)} KB)`);
+@@ -358,12 +380,9 @@
+         logger_1.logger.debug(`  ✂️  去重：${images.length} → ${uniqueImages.length} 张图片\n`);
+     }
+     // 6. 返回到笔记页面（如果需要继续提取其他信息）
+-    if (uniqueImages.length > 0) {
+-        await page.goto(noteUrl, {
+-            waitUntil: 'domcontentloaded',
+-            timeout: 15000
+-        });
+-    }
++    uniqueImages.expectedCount = imageUrls.length;
++    const sourceNoteId = new URL(noteUrl).pathname.match(/\/explore\/([a-zA-Z0-9]+)/)?.[1];
++    uniqueImages.forEach(image => image.sourceNoteId = sourceNoteId);
+     return uniqueImages;
+ }
+ /**
+@@ -441,4 +460,4 @@
+     });
+     return savedPaths;
+ }
+-//# sourceMappingURL=imageDownloader.js.map
+\ No newline at end of file
++//# sourceMappingURL=imageDownloader.js.map
+--- a/dist/tools/noteContent.js
++++ b/dist/tools/noteContent.js
+@@ -143,6 +143,17 @@
+     logger_1.logger.debug(`  ✅ 标题: ${metadata.title}`);
+     logger_1.logger.debug(`  ✅ 作者: ${metadata.author.name}`);
+     logger_1.logger.debug(`  ✅ 正文长度: ${metadata.content.length} 字`);
++    if (process.env.REDNOTE_MEDIA_DIAGNOSTICS === '1') {
++        const diagnostics = await page.evaluate(() => ({
++            noteContainer: document.querySelectorAll('#noteContainer').length,
++            sliderImages: document.querySelectorAll('img.note-slider-img').length,
++            images: Array.from(document.querySelectorAll('img')).slice(0, 8).map(img => ({
++                className: img.className, width: img.naturalWidth, height: img.naturalHeight,
++                parents: (() => { const parents = []; let el = img.parentElement; for (let i = 0; el && i < 5; i++, el = el.parentElement) parents.push({ tag: el.tagName, id: el.id, className: el.className }); return parents; })()
++            }))
++        }));
++        console.error(`笔记图片结构：${JSON.stringify(diagnostics)}`);
++    }
+     if (includeData) {
+         logger_1.logger.debug(`  ✅ 标签: ${metadata.tags.join(', ') || '无'}`);
+     }
+@@ -176,7 +187,10 @@
+         collects: metadata.collects,
+         comments: metadata.comments,
+         images,
++        expectedImageCount: images.expectedCount ?? null,
++        missingImageCount: images.expectedCount === undefined ? null : Math.max(0, images.expectedCount - images.length),
++        imageScope: images.every(image => image.sourceNoteId === metadata.noteId) && images.length > 0 ? 'current_note' : 'unverified',
+         publishTime: metadata.publishTime
+     };
+ }
+-//# sourceMappingURL=noteContent.js.map
+\ No newline at end of file
++//# sourceMappingURL=noteContent.js.map

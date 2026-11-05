@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interview-kb-workflow"
+version = "0.1.0"
+description = "Douyin/Xiaohongshu interview knowledge-base orchestration"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+interview-kb = "interview_kb.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
